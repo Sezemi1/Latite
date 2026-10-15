@@ -15,6 +15,10 @@ private:
     ValueType transparent = BoolValue(false);
     ValueType boxColor = ColorValue(1.f, 1.f, 1.f, 1.f);
 
+    // Visual-only multipliers applied to the drawn box (1.0 = the real bounding box).
+    ValueType widthScale = FloatValue(1.f);
+    ValueType heightScale = FloatValue(1.f);
+
     ValueType showEyeLine = BoolValue(true);
     ValueType eyeColor = ColorValue(1.f, 0.f, 0.f, 1.f);
 

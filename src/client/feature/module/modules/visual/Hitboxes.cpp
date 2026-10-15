@@ -9,6 +9,12 @@ Hitboxes::Hitboxes()
                LocalizeString::get("client.module.hitboxes.transparent.desc"), transparent);
     addSetting("boxColor", LocalizeString::get("client.module.hitboxes.boxColor.name"),
                LocalizeString::get("client.module.hitboxes.boxColor.desc"), boxColor);
+    addSliderSetting("widthScale", LocalizeString::get("client.module.hitboxes.widthScale.name"),
+                     LocalizeString::get("client.module.hitboxes.widthScale.desc"), widthScale, FloatValue(0.25f),
+                     FloatValue(3.f), FloatValue(0.05f));
+    addSliderSetting("heightScale", LocalizeString::get("client.module.hitboxes.heightScale.name"),
+                     LocalizeString::get("client.module.hitboxes.heightScale.desc"), heightScale, FloatValue(0.25f),
+                     FloatValue(3.f), FloatValue(0.05f));
     addSetting("showEyeLine", LocalizeString::get("client.module.hitboxes.showEyeLine.name"),
                LocalizeString::get("client.module.hitboxes.showEyeLine.desc"), this->showEyeLine);
     addSetting("eyeLine", LocalizeString::get("client.module.hitboxes.eyeLine.name"),
@@ -52,6 +58,19 @@ void Hitboxes::onRenderLevel(RenderLevelEvent& event) {
             newPos.operator-({ 0.f, eyeOffset, 0.f }).operator+({ 0.f, (bb.higher.y - bb.lower.y) / 2.f, 0.f });
         bb.rebase(rebasePos);
 
+        // Visual scaling: width/depth grow around the box center, height grows upward from the feet.
+        const float wScale = std::get<FloatValue>(widthScale).value;
+        const float hScale = std::get<FloatValue>(heightScale).value;
+        const float origLowerY = bb.lower.y;
+        if (wScale != 1.f || hScale != 1.f) {
+            const Vec3 center = bb.getCenter();
+            const float halfW = (bb.higher.x - bb.lower.x) * 0.5f * wScale;
+            const float halfD = (bb.higher.z - bb.lower.z) * 0.5f * wScale;
+            const float newHeight = (bb.higher.y - bb.lower.y) * hScale;
+            bb.lower = { center.x - halfW, origLowerY, center.z - halfD };
+            bb.higher = { center.x + halfW, origLowerY + newHeight, center.z + halfD };
+        }
+
         bool willShowLine = std::get<BoolValue>(showLine) && (!entt->isPlayer() || !connectionInfo ||
                                                               connectionInfo->hostIpAddress.empty() || entt == lp);
 
@@ -60,7 +79,8 @@ void Hitboxes::onRenderLevel(RenderLevelEvent& event) {
         auto eyeCol = std::get<ColorValue>(eyeColor).getMainColor();
 
         dc.drawBox(bb, boxCol);
-        float eyePos = newPos.y;
+        // Keep the eye line at the same relative height inside a height-scaled box.
+        float eyePos = origLowerY + (newPos.y - origLowerY) * hScale;
         float eyeLine = eyePos;
         bool customEyeLine = false;
 
