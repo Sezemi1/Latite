@@ -4,6 +4,7 @@
 #include "client/event/events/UpdateEvent.h"
 #include "mc/Addresses.h"
 #include "mc/common/client/game/ClientInstance.h"
+#include "mc/common/network/packet/ActorEventPacket.h"
 #include "mc/common/world/Minecraft.h"
 #include "mc/common/entity/component/ActorEquipmentComponent.h"
 #include "mc/common/world/Item.h"
@@ -20,7 +21,10 @@
 #include <variant>
 
 namespace {
+using namespace ArmorNametagDetail;
+
 enum class DisplayMode : int { Percentage = 0, Points = 1 };
+enum class DurabilitySource : int { Actual = 0, Estimated = 1 };
 
 // "\302\247" is the UTF-8 encoding of the section sign. Octal escapes stop after
 // three digits, so a color code can follow directly without splitting the literal.
@@ -30,7 +34,7 @@ constexpr std::string_view kSectionSign = "\302\247";
 // single source of truth for both building and stripping the line.
 constexpr std::string_view kArmorMarker = "\n\302\2478[\302\2477";
 
-constexpr std::array<char, 4> kSlotLabels{'H', 'C', 'L', 'B'}; // helmet, chest, legs, boots
+constexpr std::array<char, kSlotCount> kSlotLabels{'H', 'C', 'L', 'B'};
 constexpr int kGreenAtOrAbove = 60;
 constexpr int kYellowAtOrAbove = 25;
 
@@ -39,40 +43,38 @@ void addColor(std::string& text, char color) {
     text += color;
 }
 
-struct ArmorDurability {
-    int remaining;
-    int percent;
-};
+// Reads what this client currently believes each armor slot holds.
+ArmorSnapshot readArmor(SDK::Actor* actor) {
+    ArmorSnapshot snapshot{};
 
-std::optional<ArmorDurability> getArmorDurability(SDK::Actor* actor, int armorSlot) {
     // Actor::getArmor() dereferences the equipment component internally, so guard it first.
     auto* equipment = actor->tryGetComponent<SDK::ActorEquipmentComponent>();
-    if (!equipment || !equipment->armorContainer) return std::nullopt;
+    if (!equipment || !equipment->armorContainer) return snapshot;
 
-    auto* stack = actor->getArmor(armorSlot);
-    if (!stack) return std::nullopt;
+    for (int slot = 0; slot < kSlotCount; ++slot) {
+        auto* stack = actor->getArmor(slot);
+        if (!stack) continue;
 
-    auto* item = stack->getItem();
-    if (!item) return std::nullopt; // Empty armor slot.
+        auto* item = stack->getItem();
+        if (!item) continue; // Empty armor slot.
 
-    const int maxDamage = item->getMaxDamage();
-    if (maxDamage <= 0) return std::nullopt; // Item has no durability value.
+        const int maxDamage = item->getMaxDamage();
+        if (maxDamage <= 0) continue; // Item has no durability value.
 
-    const int damage = static_cast<int>(stack->getDamageValue());
-    const int remaining = std::clamp(maxDamage - damage, 0, maxDamage);
-    // Integer division rounds down, so a slightly damaged piece never reads "100%".
-    const int percent = remaining * 100 / maxDamage;
-    return ArmorDurability{remaining, percent};
+        const int damage = static_cast<int>(stack->getDamageValue());
+        snapshot[slot] = ArmorDurability{std::clamp(maxDamage - damage, 0, maxDamage), maxDamage};
+    }
+    return snapshot;
 }
 
-std::string makeArmorLine(SDK::Actor* actor, DisplayMode mode) {
+std::string makeArmorLine(ArmorSnapshot const& armor, SlotLosses const& losses, DisplayMode mode) {
     std::string text(kArmorMarker);
-    text.reserve(48);
+    text.reserve(56);
 
-    for (int slot = 0; slot < static_cast<int>(kSlotLabels.size()); ++slot) {
+    for (int slot = 0; slot < kSlotCount; ++slot) {
         if (slot != 0) text += ' ';
 
-        const auto durability = getArmorDurability(actor, slot);
+        const auto& durability = armor[slot];
         if (!durability) {
             addColor(text, '7');
             text += kSlotLabels[slot];
@@ -80,14 +82,17 @@ std::string makeArmorLine(SDK::Actor* actor, DisplayMode mode) {
             continue;
         }
 
-        addColor(text, durability->percent >= kGreenAtOrAbove    ? 'a'
-                       : durability->percent >= kYellowAtOrAbove ? 'e'
-                                                                 : 'c');
+        const int shown = std::clamp(durability->remaining - losses[slot], 0, durability->maxDamage);
+        // Integer division rounds down, so a slightly damaged piece never reads "100%".
+        const int percent = shown * 100 / durability->maxDamage;
+
+        addColor(text, percent >= kGreenAtOrAbove ? 'a' : percent >= kYellowAtOrAbove ? 'e' : 'c');
         text += kSlotLabels[slot];
+        if (losses[slot] > 0) text += '~'; // Only marked when the number is an estimate.
         if (mode == DisplayMode::Points) {
-            text += std::to_string(durability->remaining);
+            text += std::to_string(shown);
         } else {
-            text += std::to_string(durability->percent);
+            text += std::to_string(percent);
             text += '%';
         }
     }
@@ -131,11 +136,65 @@ ArmorNametag::ArmorNametag()
                                     LocalizeString::get("client.module.armorNametag.displayMode.points.desc")});
     addEnumSetting("displayMode", LocalizeString::get("client.module.armorNametag.displayMode.name"),
                    LocalizeString::get("client.module.armorNametag.displayMode.desc"), durabilityDisplayMode);
+
+    durabilitySource.addEntry({static_cast<int>(DurabilitySource::Actual),
+                               LocalizeString::get("client.module.armorNametag.durabilitySource.actual.name"),
+                               LocalizeString::get("client.module.armorNametag.durabilitySource.actual.desc")});
+    durabilitySource.addEntry({static_cast<int>(DurabilitySource::Estimated),
+                               LocalizeString::get("client.module.armorNametag.durabilitySource.estimated.name"),
+                               LocalizeString::get("client.module.armorNametag.durabilitySource.estimated.desc")});
+    addEnumSetting("durabilitySource", LocalizeString::get("client.module.armorNametag.durabilitySource.name"),
+                   LocalizeString::get("client.module.armorNametag.durabilitySource.desc"), durabilitySource);
+
     addSliderSetting("maxDistance", LocalizeString::get("client.module.armorNametag.maxDistance.name"),
                      LocalizeString::get("client.module.armorNametag.maxDistance.desc"), maxDistance,
                      FloatValue(0.f), FloatValue(128.f), FloatValue(1.f));
 
     listen<UpdateEvent>((EventListenerFunc)&ArmorNametag::onUpdate);
+    listen<PacketReceiveEvent>((EventListenerFunc)&ArmorNametag::onPacketReceive);
+}
+
+void ArmorNametag::onPacketReceive(Event& evG) {
+    // Hits are only needed for the estimate; don't collect them otherwise.
+    if (static_cast<DurabilitySource>(durabilitySource.getSelectedKey()) != DurabilitySource::Estimated) return;
+
+    auto& ev = reinterpret_cast<PacketReceiveEvent&>(evG);
+    auto* pkt = ev.getPacket();
+    if (!pkt || pkt->getID() != SDK::PacketID::ACTOR_EVENT) return;
+
+    auto* actorEvent = static_cast<SDK::ActorEventPacket*>(pkt);
+    if (actorEvent->eventID != SDK::ActorEventID::HURT_ANIMATION) return;
+
+    std::lock_guard lock(hitMutex);
+    ++pendingHits[actorEvent->runtimeID];
+}
+
+// Compares the freshly read armor with what we saw last time. A changed value means
+// the server synced new data (re-equip, Mending, spawn, ...), so the estimate resets
+// to it. Otherwise each hit since the last update is assumed to cost 1 point per piece.
+SlotLosses ArmorNametag::estimateLosses(uint64_t runtimeId, ArmorSnapshot const& armor, int newHits) {
+    auto& player = estimates[runtimeId];
+    player.lastSeen = updateCounter;
+
+    SlotLosses losses{};
+    for (int slot = 0; slot < kSlotCount; ++slot) {
+        auto& estimate = player.slots[slot];
+
+        if (!armor[slot]) {
+            estimate = SlotEstimate{};
+            continue;
+        }
+
+        const int remaining = armor[slot]->remaining;
+        if (remaining != estimate.lastActual) {
+            estimate.lastActual = remaining;
+            estimate.loss = 0;
+        } else {
+            estimate.loss = std::min(estimate.loss + newHits, armor[slot]->maxDamage);
+        }
+        losses[slot] = estimate.loss;
+    }
+    return losses;
 }
 
 void ArmorNametag::onUpdate(Event&) {
@@ -147,8 +206,19 @@ void ArmorNametag::onUpdate(Event&) {
     if (!level || !localPlayer) return;
 
     const auto mode = static_cast<DisplayMode>(durabilityDisplayMode.getSelectedKey());
+    const bool estimating =
+        static_cast<DurabilitySource>(durabilitySource.getSelectedKey()) == DurabilitySource::Estimated;
     const float maxDist = getFloatOrDefault(maxDistance, 32.f); // <= 0 means unlimited.
     const auto localPos = localPlayer->getPos();
+
+    ++updateCounter;
+    hitsScratch.clear();
+    if (estimating) {
+        std::lock_guard lock(hitMutex);
+        hitsScratch.swap(pendingHits); // pendingHits becomes the (empty) old scratch map.
+    } else if (!estimates.empty()) {
+        estimates.clear();
+    }
 
     for (SDK::Actor* actor : level->getRuntimeActorList()) {
         if (!actor || actor == localPlayer || !actor->isPlayer()) continue;
@@ -165,16 +235,37 @@ void ArmorNametag::onUpdate(Event&) {
         // the line once a player is farther away than the configured range.
         const bool inRange = maxDist <= 0.f || actor->getPos().distance(localPos) <= maxDist;
         if (!baseTag.empty() && !actor->isInvisible() && inRange) {
-            desiredTag += makeArmorLine(actor, mode);
+            const ArmorSnapshot armor = readArmor(actor);
+
+            SlotLosses losses{};
+            if (estimating) {
+                const uint64_t runtimeId = actor->getRuntimeID();
+                const auto hit = hitsScratch.find(runtimeId);
+                losses = estimateLosses(runtimeId, armor, hit != hitsScratch.end() ? hit->second : 0);
+            }
+            desiredTag += makeArmorLine(armor, losses, mode);
         }
 
         if (desiredTag != currentTag) {
             actor->setNameTag(&desiredTag);
         }
     }
+
+    // Forget players we didn't update this pass (despawned, out of range, invisible).
+    if (estimating) {
+        for (auto it = estimates.begin(); it != estimates.end();) {
+            it = it->second.lastSeen == updateCounter ? std::next(it) : estimates.erase(it);
+        }
+    }
 }
 
 void ArmorNametag::onDisable() {
+    {
+        std::lock_guard lock(hitMutex);
+        pendingHits.clear();
+    }
+    estimates.clear();
+
     auto* level = currentLevel();
     if (!level || !nameTagApiReady()) return;
 
